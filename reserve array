@@ -1,0 +1,27 @@
+//小Q定义了一种数列称为翻转数列: 给定整数n和m, 满足n能被2m整除。对于一串连续递增整数数列1, 2, 3, 4..., 每隔m个符号翻转一次, 最初符号为'-';。
+#include <iostream>
+using namespace std;
+
+long solution(long n,long m)
+{
+    long sum = 0;
+    long n1 = 1;
+    int flag = -1;
+    while(n1 <= n)
+    {
+       sum = (((flag*n1+(n1+m-1)*flag)*m)/2)+sum;
+        n1 += m;
+        flag = -flag;
+    }
+    return sum;
+}
+
+int main()
+{
+    long n;
+    long m;
+    cin>>n;
+    cin>>m;
+    cout<<solution(n,m)<<endl;
+    return 0;
+}
