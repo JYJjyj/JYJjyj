@@ -45,3 +45,51 @@ public:
   	
     }
 };
+#include <iostream>
+#include <string>
+#include <math.h>
+#include <string.h>
+#include <stddef.h>
+#include <stdlib.h>
+using namespace std;
+
+class Replacement {
+public:
+	string replaceSpace(string iniString, int length) {
+		int blanknum = 0;
+		iniString.reserve(1000);
+		for (int i = 0; i < iniString.size(); i++)
+		{
+			if (iniString[i] == ' ')
+				blanknum++;
+		}
+		int newsize = blanknum * 2 + iniString.size();
+		if (iniString.capacity() < newsize)
+			return NULL;
+		int j = iniString.size() - 1;
+		if (blanknum == 0)
+			return iniString;
+		iniString.resize(newsize,'0');
+		for (int i = newsize - 1; i >= 0; i--)
+		{
+			if (iniString[j] == ' ')
+			{
+				iniString[i--] = '0';
+				iniString[i--] = '2';
+				iniString[i] = '%';
+				j--;
+			}
+			else
+				iniString[i] = iniString[j--];
+		}
+		return iniString;
+	}
+};
+int main()
+{
+	Replacement s;
+	string a(" hello world   ");
+	cout << s.replaceSpace(a, a.size()) << endl;
+	system("pause");
+	return 0;
+}
