@@ -1,3 +1,4 @@
+//数组中连续子序列的最大和
 #include <iostream>
 #include <algorithm>
 #include <stddef.h>
