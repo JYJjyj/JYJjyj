@@ -10,6 +10,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/sendfile.h>
 typedef struct sockaddr_in sockaddr_in;
 typedef struct sockaddr sockaddr;
 
@@ -59,6 +62,7 @@ int ReadLine(int sock, char output[], ssize_t max_size)
                 c = '\n';
             }
         }
+        output[i++] = c;
     //此时无论分隔符是什么，c 都成了\n
     //针对这两种情况，都把当前字符转换成\n
     //4. 如果当前字符是\n直接结束函数，（这一行已经读完）
@@ -67,7 +71,6 @@ int ReadLine(int sock, char output[], ssize_t max_size)
             break;
         }
     //5. 如果当前字符是一个普通字符，直接追加到输出结果中
-        output[i++] = c;
     }
     output[i] = '\0';
     return i;   //返回i，当前缓冲区写了多少个字符
@@ -77,7 +80,7 @@ int Split(char input[], const char* split_char, char* output[])
 {
     char* tmp = NULL;
     int output_index = 0;
-    char* p = strtok(input, split_char);
+    char* p = strtok_r(input, split_char,&tmp);
     while(p != NULL)
     {
         output[output_index++] = p;
@@ -128,7 +131,6 @@ int ParseUrl(char url[], char** p_url_path, char** p_query_string)
     //http://www.baidu.com也没有？，所以不能直接返回错误.
     *p_url_path = NULL;
     return 0;
-
 }
 
 int ParseHeader(int new_sock, int* content_length)
@@ -136,13 +138,149 @@ int ParseHeader(int new_sock, int* content_length)
     char buf[SIZE] = {0};
     while(1)
     {
-        ssize_t read_size = ReadLine(new_sock, buf, )
+        ssize_t read_size = ReadLine(new_sock, buf, sizeof(buf) - 1);
+        if(read_size <= 0)
+        {
+            return -1;
+        }
+        if(strcmp(buf, "\n") == 0)
+        {
+            return 0;
+        }
+        //content-length : 100\n
+        const char* key = "Content-Length: ";
+        if(strncasecmp(buf, key, strlen(key)) == 0)
+        {
+            *content_length = atoi(buf + strlen(key));
+            //此处的不可以使用break，否则就是粘包问题
+            //break;
+        }
     }
+    return 0;
+}
+
+void Handler404(int new_sock)
+{
+    const char* first_line = "HTTP/1.1 404 Not Found\n";
+    //此处的代码可以是先不加Header部分
+    //content-type 可以让浏览器自动识别
+    //content-length 可以通过关闭socket 
+    //的方式告知浏览器已经读完了
+    //
+    //body部分就是 html 页面
+    
+    const char* blank_line = "\n";
+    const char* body = "<head><meta http-equiv=\"Content-Type\" content=\"text/html;charset=utf-8\"></head>\
+                        <h1>404!!!~~~~~~~~a hahahahaha   你是一只大傻猪~~~~~~~~~</h1>";
+    send(new_sock, first_line, strlen(first_line), 0);
+    send(new_sock, blank_line, strlen(blank_line), 0);
+    send(new_sock, body, strlen(body), 0);
+    return; 
+}
+
+int isDir(const char* file_path)
+{
+    struct stat st;
+    int ret = stat(file_path, &st);
+    if(ret < 0)
+    {
+        // 此处不是目录
+        return 0;
+    }
+    if(S_ISDIR(st.st_mode))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+ssize_t GetFileSize(const char* file_path)
+{
+    struct stat st;
+    int ret = stat(file_path, &st);
+    if(ret < 0)
+        return 0;
+    return st.st_size;
+}
+
+int WriteStaticFile(int new_sock, const char* file_path)
+{
+    //1. 打开文件。如果打开失败，就返回404
+    int fd = open(file_path, O_RDONLY);
+    if(fd < 0)
+    {
+        perror("open");
+        return 404;
+    }
+    //2. 构造 HTTP 响应报文
+    const char* first_line = "HTTP/1.1 200 OK\n";
+    send(new_sock, first_line, strlen(first_line), 0);
+    // 此处如果从一个严谨的角度考虑需要加上一些 header
+    // 此处没有写content-type 是因为浏览器能够自动识别
+    // 没有写content-length 是因为后面立刻关闭了 socket
+    // 浏览器就能识别出什么时候结束
+    const char* blank_line = "\n";
+    send(new_sock, blank_line, strlen(blank_line), 0);
+    //3. 读文件内容并且写到 socket 之中
+    //这里我们使用的是更高效的 sendfile 来完成文件传输操作
+    //char c = '\0';
+    //while(read(new_sock, &c, 1) > 0)
+    //{
+    //    send(new_sock, &c, 1, 0);
+    //}
+    ssize_t file_size = GetFileSize(file_path);
+    sendfile(new_sock, fd, NULL, file_size);
+    //4. 关闭文件
+    close(fd);
+    return 200;
+}
+
+void HandlerFilePath(const char* url_path, char file_path[])
+{
+    //url_path 是以 / 开头的，所以不需要 wwwroot 之后显式指明 /
+    sprintf(file_path, "./wwwroot%s", url_path);
+    //strcat(file_path, url_path);
+    // 如果 url_path 指向的目录，就在目录后面拼装上 index.html 作为默认访问的文件
+    // 如何识别url_path 指向的文件是普通文件还是目录呢？
+    // a) url_path 以 / 结尾，例如：/image/
+    if(file_path[strlen(file_path) - 1] == '/')
+    {
+        strcat(file_path, "index.html");
+    }
+    else
+    {
+        // b) url_path 没有以 / 结尾，此时需要根据文件属性来判定是否是目录
+        if(isDir(file_path))
+        {
+            strcat(file_path, "/index.html");
+        }
+    }
+}
+
+int HandlerStaticFile(int new_sock, const HttpRequest* req)
+{
+    //1.根据 url_path 获取到文件的真实路径
+    //例如，此时 HTTP 服务器的根目录叫做 ./wwwroot
+    //此时有一个文件 ./wwwroot/image/101.jpg
+    //在 url 中写 path 就叫做 /image/101.jpg
+    char file_path[SIZE] = {0};
+    //根据下面的函数把 /image/yyqx.jpg 转换成了
+    //磁盘上的 ./wwwroot/yyqx.jpg
+    HandlerFilePath(req->url_path, file_path);
+    //2.打开文件，读取文件内容，把文件内容写到 socket 中
+    int err_code = WriteStaticFile(new_sock, file_path);
+    return err_code;
+}
+
+int HandlerCGI()
+{
+    return 404;
 }
 
 //完成具体的请求处理过程
 void HandlerRequest(int64_t new_sock)
 {
+    int err_code = 200;
     HttpRequest req;
     memset(&req, 0, sizeof(req));
     //1.解析请求
@@ -150,45 +288,57 @@ void HandlerRequest(int64_t new_sock)
     //  char first_line[size] = {0};
     if(ReadLine(new_sock, req.first_line, sizeof(req.first_line) - 1) < 0)
     {
-        
+        //错误处理，此处一旦触发错误处理逻辑
+        //此处我们就只返回404的数据报
+        //正常来说，根据不同的错误原因返回不同的数据报
+        err_code = 404;
+        goto END; 
     }
     printf("first_line: %s\n",req.first_line);
     //  b) 解析首行，获取到 url 和 method
     if(ParseFirstLine(req.first_line, &req.method, &req.url) < 0)
     {
-
+        err_code = 404;
+        goto END; 
     }
     //  c) 解析url，获取到url_path 和 query_string
     if(ParseUrl(req.url, &req.url_path, &req.query_string) < 0)
     {
-
+        err_code = 404;
+        goto END; 
     }
     //  d) 解析 header，丢弃大部分 header，只保留Content-Length
     if(ParseHeader(new_sock, &req.content_length))
     {
-
+        err_code = 404;
+        goto END; 
     }
-    //2.根据请求请求计算响应并写辉客户端
+    //2.根据请求计算响应并写回客户端
     if(strcasecmp(req.method, "GET") == 0 && req.query_string == NULL)
     {
         //处理静态页面
-        HandlerStaticFile();
+        err_code = HandlerStaticFile(new_sock, &req);
     }
     else if(strcasecmp(req.method, "GET") == 0 && req.query_string != NULL)
     {
         //处理动态页面
-        HandlerCGI();
+        err_code = HandlerCGI();
     }
     else if(strcasecmp(req.method, "POST") == 0)
     {
         //处理动态页面
-        HandlerCGI();
+        err_code = HandlerCGI();
     }
     else
     {
         //错误处理
+        err_code = 404;
+        goto END; 
     }
     //收尾工作,主动关闭socket, 会进入 TIME_WAIT
+END:
+    if(err_code != 200)
+        Handler404(new_sock);
     close(new_sock);
 }
 
@@ -258,8 +408,6 @@ int main(int argc, char* argv[])
         printf("usage ./http_server [ip] [port]\n");
         return 1;
     }
-    HttpServerStart(argv[1], atoi(argv[2]))
-    {
-
-    }
+    HttpServerStart(argv[1], atoi(argv[2]));
+    return 0;
 }
