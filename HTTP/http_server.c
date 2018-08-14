@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/sendfile.h>
+#include <sys/wait.h>
 typedef struct sockaddr_in sockaddr_in;
 typedef struct sockaddr sockaddr;
 
@@ -129,7 +130,7 @@ int ParseUrl(char url[], char** p_url_path, char** p_query_string)
         }
     }
     //http://www.baidu.com也没有？，所以不能直接返回错误.
-    *p_url_path = NULL;
+    *p_query_string = NULL;
     return 0;
 }
 
@@ -272,9 +273,152 @@ int HandlerStaticFile(int new_sock, const HttpRequest* req)
     return err_code;
 }
 
-int HandlerCGI()
+int HandlerCGIFather(int new_sock, int father_read, int father_write, const HttpRequest* req)
 {
-    return 404;
+    //  a) 如果是 POST 请求，把 body 部分的数据都出来写到管道中
+    //      剩下的动态生成页面的过程都交给子进程来完成
+    if(strcasecmp(req->method, "POST") == 0)
+    {
+        char c ='\0';
+        int i = 0;
+        // 此处不可以使用sendfile函数，因为sendfile要求目标文件描述符必须是一个socket
+        //为什么不一次将所有的数据全部读出来？
+        //若是 body 很长，那么read是很可能在读写过程中被信号打断
+        //就会导致 body 没有被完全读完
+        //即使缓冲区足够长， read还是很可能被打断
+        for(; i < req->content_length; i++)
+        {
+            read(new_sock, &c, 1);
+            write(father_write, &c, 1);
+        }
+    }
+    //  b) 构造 HTTP 响应中的首行， header，空行
+    const char* first_line = "HTTP/1.1 200 OK\n";
+    send(new_sock, first_line, strlen(first_line), 0);
+    //此处先不管header， 浏览器可以自动识别header，也会知道什么时候结束
+    //为了简单先不管。
+    const char*blank_line = "\n"; 
+    send(new_sock, blank_line, strlen(blank_line), 0);
+    
+    //  c) 从管道中读取数据（自数据动态生成的页面），把这个数据也写到socket之中
+    //     此处也不能使用 sendfile， 因为数据的长度不容易确定。所以还是使用循环来
+    char c = '\0';
+    while(read(father_read, &c, 1) > 0)
+    {
+        write(new_sock, &c, 1);
+    }
+    //  d) 进程等待，回收子进程的资源。
+    //  此处如果要进行进程等待，那么最好使用waitpid
+    //  保证当前线程回收的子进程就是自己当时创建的那个子进程
+    //  更简洁的做法，是直接使用忽略 SIGCILD 信号(在 main 函数中)
+    return 200;
+}
+
+int HandlerCGIChild(int child_read, int child_write, const HttpRequest* req)
+{
+    //  a) 设置环境变量 (METHOD, CONTENT_LENGTH, QUERY_STRING)
+    //      如果把上面这几个信息通过管道来告知替换之后的程序。
+    //      也是完全可行的，但是此处我们是要遵守 CGI 标准。所以
+    //      必须使用环境变量传递以上的信息
+    //      注意！！！ 设置环境变量的步骤，不能由父进程来进行
+    //      虽然子进程能够继承父进程的环境变量，由于同一时刻
+    //      会有多个请求，每个请求都在尝试修改父进程的环境变量
+    //      就会产生类似于线程安全的问题，导致子进程不能正确的
+    //      获取到这些信息
+    char method_env[SIZE] = {0};
+    sprintf(method_env, "REQUEST_METHOD=%s", req->method);
+    putenv(method_env);
+    if(strcasecmp(req->method, "GET") == 0)
+    {
+        //设置 QUERY_STRING
+        char query_string_env[SIZE] = {0};
+        sprintf(query_string_env, "QUERY_STRING=%s", req->query_string);
+        putenv(query_string_env);
+    }
+    else
+    {
+        //设置 CONTENT_LENGTH
+        char content_length_env[SIZE] = {0};
+        sprintf(content_length_env, "CONTENT_LENGTH=%d", req->content_length);
+        putenv(content_length_env);
+    }
+    //  b) 把标准输入和标准输出重定向到管道上.此时CGI程序读写标准
+    //      输入输出就相当于读写管道
+    //      由于CGI机制是不限定编程语言的，所以，有些语言在访问管道时
+    //      就会有困难，为了方便读写就需要重定向
+    dup2(child_read, 0);
+    dup2(child_write, 1);
+    //  c) 子进程进行程序替换（需要先找到是哪个CGI可执行程序，然后
+    //      再使用 exec 函数进行替换）
+    //      替换成功之后，动态页面完全交给 CGI 程序进行计算生成
+    //      假设 url_path 值为 /cgi-bin/test
+    //      说明对应的 CGI 程序的路径就是 ./wwwroot/cgi-bin/test
+    char file_path[SIZE] = {0};
+    HandlerFilePath(req->url_path, file_path);
+    // 第一个参数可执行程序的路径
+    // 第二个参数，argv[0]
+    // 第三个参数传NULL，表示命令行参数结束了
+    execl(file_path, file_path, NULL);
+    //  d) 替换失败的错误处理, 子进程就是为了替换而生的
+    //      如果替换失败，子进程也就没有存在的必要了，
+    //      反而如果子进程继续存在，继续执行父进程原有的代码，
+    //      就有可能对父进程原有的逻辑造成干扰
+    exit(0);
+}
+
+int HandlerCGI(int new_sock, const HttpRequest* req)
+{
+    int err_code = 200;
+    // 1. 创建一对匿名管道
+    int fd1[2], fd2[2];
+    pipe(fd1);
+    pipe(fd2);
+    int father_read = fd1[0];
+    int child_write = fd1[1];
+    int father_write = fd2[1];
+    int child_read = fd2[0];
+    // 2. 创建子进程 fork 
+    pid_t ret = fork();
+    if(ret > 0)
+    {
+    // 3. 父进程核心流程：
+        //father
+        //此处先把不必要的文件描述符关闭掉
+        //为了保证后面父进程从管道中读数据的时候，read能够正确
+        //返回不阻塞。后面的代码中会循环从管道中读数据，读到EOF
+        //就认为读完了，循环退出，而对于管道来说，必须所有的写端
+        //关闭，再进行读写，才是读到EOF
+        //而这里所有的写端包含父进程的写端和子进程的写端
+        //子进程的写端会随着子进程的终止而自动关闭
+        //父进程的写端，就可以在此处，直接关闭
+        //（父进程不需要使用这个写端）
+        close(child_write);
+        close(child_read);
+        HandlerCGIFather(new_sock, father_read, father_write, req);
+    }
+    else if(ret == 0)
+    {
+        //child
+        // 4.子进程核心流程：
+        close(father_write);
+        close(father_read);
+        HandlerCGIChild(child_read, child_write, req);
+    }
+    else
+    {
+        perror("fork");
+        err_code = 404;
+        goto END;
+        //error
+    }
+    //  
+END:
+    //收尾工作
+    close(father_read);
+    close(father_write);
+    close(child_read);
+    close(child_write);
+    return err_code;
 }
 
 //完成具体的请求处理过程
@@ -322,12 +466,12 @@ void HandlerRequest(int64_t new_sock)
     else if(strcasecmp(req.method, "GET") == 0 && req.query_string != NULL)
     {
         //处理动态页面
-        err_code = HandlerCGI();
+        err_code = HandlerCGI(new_sock, &req);
     }
     else if(strcasecmp(req.method, "POST") == 0)
     {
         //处理动态页面
-        err_code = HandlerCGI();
+        err_code = HandlerCGI(new_sock, &req);
     }
     else
     {
@@ -408,6 +552,7 @@ int main(int argc, char* argv[])
         printf("usage ./http_server [ip] [port]\n");
         return 1;
     }
+    signal(SIGCHLD, SIG_IGN);
     HttpServerStart(argv[1], atoi(argv[2]));
     return 0;
 }
